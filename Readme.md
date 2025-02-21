@@ -1,0 +1,2 @@
+maturin build
+maturin develop
