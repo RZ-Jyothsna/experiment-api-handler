@@ -61,7 +61,7 @@ impl ApiResp {
 
 #[pyclass]
 #[derive(Default, FromPyObject)]
-struct ApiReqInit {
+struct ApiReq {
     #[pyo3(get, set)]
     pub url: String,
     #[pyo3(get, set)]
@@ -87,7 +87,7 @@ struct ApiReqInit {
 }
 
 #[pymethods]
-impl ApiReqInit {
+impl ApiReq {
     #[new]
     fn new(
         url: String,
@@ -102,7 +102,7 @@ impl ApiReqInit {
         retry_sleep: Option<i32>,
         use_worker: Option<bool>,
     ) -> Self {
-        ApiReqInit {
+        ApiReq {
             url,
             options,
             method,
@@ -119,7 +119,7 @@ impl ApiReqInit {
 }
 
 #[derive(Default, Debug)]
-pub struct ApiReq {
+pub struct ApiReqInit {
     url: String,
     options: Option<HashMap<String, String>>,
     method: ReqMethod,
@@ -136,15 +136,15 @@ pub struct ApiReq {
 }
 
 
-impl ApiReq {
-    fn new(req: ApiReqInit) -> Self {
+impl ApiReqInit {
+    fn new(req: ApiReq) -> Self {
         // TODO: Finish this match.
         let method = match req.method.as_deref() {
             Some("GET") => ReqMethod::GET,
             Some("POST") => ReqMethod::POST,
             _ => ReqMethod::GET,
         };
-        ApiReq {
+        ApiReqInit {
             url: req.url,
             options: req.options,
             method,
@@ -220,9 +220,25 @@ impl ApiReq {
 
         if resp_status == 200 {
             // TODO: handle Error
-            api_resp.json = Some(resp.json().await.unwrap());
+            let json = resp.json().await.map_err(|e| e.to_string());
+            match json {
+                Ok(json) => {
+                    api_resp.json = Some(json);
+                }
+                Err(e) => {
+                    api_resp.error_msg = Some(format!("Error: {e}"));
+                }
+            }
         } else {
-            api_resp.text = Some(resp.text().await.unwrap());
+            let text = resp.text().await.map_err(|e| e.to_string());
+            match text {
+                Ok(text) => {
+                    api_resp.text = Some(text);
+                }
+                Err(e) => {
+                    api_resp.error_msg = Some(format!("Error: {e}"));
+                }
+            }
         }
 
         if self.use_worker {
@@ -233,27 +249,19 @@ impl ApiReq {
 
     }
 
-    async fn get(&mut self) -> Result<ApiResp, String> {
-        let client = reqwest::Client::new();
-
-        if self.use_worker {
-            self.before_request().await;
+    fn get_headers(&self) -> HeaderMap {
+        let mut api_headers = HeaderMap::new();
+        if let Some(headers) = &self.headers.clone() {
+            for (k, v) in headers {
+                // TODO: Handle Error
+                api_headers.insert(HeaderName::try_from(k).unwrap(), HeaderValue::from_str(v).unwrap());
+            }
         }
-
-        let res = client.get(&self.url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let response = self.handle_response(res).await?;
-        Ok(response)
+        api_headers
     }
 
-    async fn post(&mut self) -> Result<ApiResp, String> {
-
-        println!("POST request2");
-
-        if self.use_worker {
+    async fn make_api_call(&mut self) -> Result<ApiResp, String> {
+         if self.use_worker {
             self.before_request().await;
             // Post request to worker and return request_id in resp.
         }
@@ -265,32 +273,46 @@ impl ApiReq {
             .take(self.max_retries as usize);
         
         Retry::spawn(retry_strategy, || {
-            println!("in spawn");
             
             let client = &client;
             let url = self.url.clone();
+            let method = self.method.clone();
             let options = self.options.clone();
             let handle_resp = |res| {
                 self.handle_response(res)
             };
 
-            let mut api_headers = HeaderMap::new();
+            let mut api_headers = self.get_headers();
 
-            if let Some(headers) = self.headers.clone() {
-                for (k, v) in headers {
-                    // TODO: Handle Error
-                    api_headers.insert(HeaderName::try_from(&k).unwrap(), HeaderValue::from_str(&v).unwrap());
-                }
-            }
-
-            println!("api_headers: {:?}", api_headers);
+            println!("method: {:?}", method);
 
             async move {
-                let res = client.post(&url)
-                    .json(&options)
-                    .headers(api_headers)
-                    .send()
-                    .await.map_err(|e| e.to_string())?;
+                let res = match method {
+                    ReqMethod::POST => client.post(&url)
+                        .json(&options)
+                        .headers(api_headers)
+                        .send()
+                        .await.map_err(|e| e.to_string())?,
+                    ReqMethod::PUT => client.put(&url)
+                        .json(&options)
+                        .headers(api_headers)
+                        .send()
+                        .await.map_err(|e| e.to_string())?,
+                    ReqMethod::PATCH => client.patch(&url)
+                        .json(&options)
+                        .headers(api_headers)
+                        .send()
+                        .await.map_err(|e| e.to_string())?,
+                    ReqMethod::DELETE => client.delete(&url)
+                        .json(&options)
+                        .headers(api_headers)
+                        .send()
+                        .await.map_err(|e| e.to_string())?,
+                    _ => client.get(&url)
+                        .headers(api_headers)
+                        .send()
+                        .await.map_err(|e| e.to_string())?,
+                };
 
                 // TODO: Update this response in ApiReq resp.
                 let response = handle_resp(res).await?;
@@ -302,26 +324,27 @@ impl ApiReq {
     }
 }
 
-async fn make_api_call(req: &mut ApiReq) -> Result<ApiResp, String> {
-    if req.method == ReqMethod::GET {
-        let resp = req.get().await?;
-        Ok(resp)
-    } else {
-        let resp = req.post().await?;
-        Ok(resp)
-    }
-}
-
 #[pyfunction]
-fn api_handler_fn(py: Python, req: ApiReqInit) -> PyResult<ApiResp> {
-    println!("API handler called");
-    let mut api_req = ApiReq::new(req);
+fn get(py: Python, req: ApiReq) -> PyResult<ApiResp> {
+    let mut api_req = ApiReqInit::new(req);
 
-    // TODO: Handle this error.
     let rt = Runtime::new().unwrap();
 
     let result = rt.block_on(
-        make_api_call(&mut api_req)
+        api_req.make_api_call()
+    ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
+
+    Ok(result)
+}
+
+#[pyfunction]
+fn post(py: Python, req: ApiReq) -> PyResult<ApiResp> {
+    let mut api_req = ApiReqInit::new(req);
+
+    let rt = Runtime::new().unwrap();
+
+    let result = rt.block_on(
+        api_req.make_api_call()
     ).map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{}", e)))?;
 
     Ok(result)
@@ -334,9 +357,10 @@ pub fn example_fn() {
 
 #[pymodule]
 fn api_handler(py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_class::<ApiReqInit>()?;
+    m.add_class::<ApiReq>()?;
     m.add_class::<ApiResp>()?;
-    m.add_function(wrap_pyfunction!(api_handler_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(get, m)?)?;
+    m.add_function(wrap_pyfunction!(post, m)?)?;
     m.add_function(wrap_pyfunction!(example_fn, m)?)?;
     Ok(())
 }
