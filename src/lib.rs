@@ -198,6 +198,7 @@ impl ApiReqInit {
     }
 
     async fn handle_response(&self, resp: Response) -> Result<ApiResp, String> {
+        println!("resp: {:?}", resp);
         // Adding new ApiResp, instead of overwriting the resp in ApiReq. (Not sure if this is the best way)
         let mut api_resp = ApiResp::new(ApiRespInit {
             key: if let Some(val) = &self.key { val.clone() } else { "".to_string() },
@@ -218,27 +219,17 @@ impl ApiReqInit {
             return Err("Internal Sever Error".to_string());
         }
 
-        if resp_status == 200 {
-            // TODO: handle Error
-            let json = resp.json().await.map_err(|e| e.to_string());
-            match json {
-                Ok(json) => {
-                    api_resp.json = Some(json);
-                }
-                Err(e) => {
-                    api_resp.error_msg = Some(format!("Error: {e}"));
-                }
+        let text = resp.text().await;
+
+        if let Some(text) = text.ok() {
+
+            let parsed = serde_json::from_str(&text);
+
+            if let Some(parsed) = parsed.ok() {
+                api_resp.json = Some(parsed);
             }
-        } else {
-            let text = resp.text().await.map_err(|e| e.to_string());
-            match text {
-                Ok(text) => {
-                    api_resp.text = Some(text);
-                }
-                Err(e) => {
-                    api_resp.error_msg = Some(format!("Error: {e}"));
-                }
-            }
+
+            api_resp.text = Some(text);
         }
 
         if self.use_worker {
@@ -283,8 +274,6 @@ impl ApiReqInit {
             };
 
             let mut api_headers = self.get_headers();
-
-            println!("method: {:?}", method);
 
             async move {
                 let res = match method {
