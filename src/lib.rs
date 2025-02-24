@@ -131,6 +131,7 @@ pub struct ApiReqInit {
     retry_index: i8,
     auto_retry: bool,
     retry_sleep: i32,
+    // Check if this is needed.
     resp: Option<ApiResp>,
     use_worker: bool,
 }
@@ -138,10 +139,11 @@ pub struct ApiReqInit {
 
 impl ApiReqInit {
     fn new(req: ApiReq) -> Self {
-        // TODO: Finish this match.
         let method = match req.method.as_deref() {
-            Some("GET") => ReqMethod::GET,
             Some("POST") => ReqMethod::POST,
+            Some("PUT") => ReqMethod::PUT,
+            Some("PATCH") => ReqMethod::PATCH,
+            Some("DELETE") => ReqMethod::DELETE,
             _ => ReqMethod::GET,
         };
         ApiReqInit {
@@ -205,31 +207,41 @@ impl ApiReqInit {
             ..Default::default()
         });
 
-        let resp_status = resp.status();
+        // Headers
+        api_resp.headers = Some(resp.headers().iter().map(|(k, v)| {
+            let value = v.to_str();
+            
+            if let Ok(header_val) = value {
+                return (k.as_str().to_string(), header_val.to_string());
+            }
+            (k.as_str().to_string(), "".to_string())
+        }).collect());
 
-        api_resp.headers = Some(resp.headers().iter().map(|(k, v)| (
-            // TODO: handle Error
-            k.as_str().to_string(), v.to_str().unwrap().to_string()
-        )).collect());
+        // Status
+        let resp_status = resp.status();
         api_resp.status = resp_status.as_u16();
     
         if resp_status == StatusCode::INTERNAL_SERVER_ERROR {
             api_resp.error_msg = Some(format!("Server Error: {resp_status}"));
 
-            return Err("Internal Sever Error".to_string());
+            return Err("Sever Error".to_string());
         }
 
         let text = resp.text().await;
 
-        if let Some(text) = text.ok() {
+        if let Ok(text) = text {
 
             let parsed = serde_json::from_str(&text);
 
-            if let Some(parsed) = parsed.ok() {
+            if let Ok(parsed) = parsed {
                 api_resp.json = Some(parsed);
             }
-
-            api_resp.text = Some(text);
+            
+            if resp_status == StatusCode::OK {
+                api_resp.text = Some(text);
+            } else {
+                api_resp.error_msg = Some(text);
+            }
         }
 
         if self.use_worker {
@@ -244,8 +256,10 @@ impl ApiReqInit {
         let mut api_headers = HeaderMap::new();
         if let Some(headers) = &self.headers.clone() {
             for (k, v) in headers {
-                // TODO: Handle Error
-                api_headers.insert(HeaderName::try_from(k).unwrap(), HeaderValue::from_str(v).unwrap());
+                let key = HeaderName::try_from(k);
+                if let Ok(key) = key {
+                    api_headers.insert(key, HeaderValue::from_str(v).unwrap());
+                }
             }
         }
         api_headers
@@ -303,7 +317,6 @@ impl ApiReqInit {
                         .await.map_err(|e| e.to_string())?,
                 };
 
-                // TODO: Update this response in ApiReq resp.
                 let response = handle_resp(res).await?;
 
                 println!("Response: {:?}", response);
@@ -350,6 +363,7 @@ fn api_handler(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<ApiResp>()?;
     m.add_function(wrap_pyfunction!(get, m)?)?;
     m.add_function(wrap_pyfunction!(post, m)?)?;
+    // Add more req methods here.
     m.add_function(wrap_pyfunction!(example_fn, m)?)?;
     Ok(())
 }
