@@ -7,6 +7,10 @@ use tokio_retry::Retry;
 use pyo3::prelude::*;
 use pyo3::{types::PyString, FromPyObject};
 use tokio::runtime::Runtime;
+use crate::workers::*;
+
+mod workers;
+mod dynamoDB;
 
 pub type ReqMethod = reqwest::Method;
 
@@ -265,64 +269,75 @@ impl ApiReqInit {
         api_headers
     }
 
-    async fn make_api_call(&mut self) -> Result<ApiResp, String> {
+    async fn make_api_call(mut self) -> Result<ApiResp, String> {
          if self.use_worker {
-            self.before_request().await;
+            &mut self.before_request().await;
             // Post request to worker and return request_id in resp.
-        }
+            let message_id = sqs::send_message("", None, self.url).await.map_err(|e| e.to_string())?;
 
-        let client = reqwest::Client::new();
+            let resp = ApiResp::new(ApiRespInit {
+                key: message_id.clone(),
+                text: Some(message_id),
+                ..Default::default()
+            });
 
-        let retry_strategy = ExponentialBackoff::from_millis(self.retry_sleep as u64)
-            .map(jitter)
-            .take(self.max_retries as usize);
-        
-        Retry::spawn(retry_strategy, || {
+            Ok(resp)
+
+        } else {
+
+            let client = reqwest::Client::new();
+
+            let retry_strategy = ExponentialBackoff::from_millis(self.retry_sleep as u64)
+                .map(jitter)
+                .take(self.max_retries as usize);
             
-            let client = &client;
-            let url = self.url.clone();
-            let method = self.method.clone();
-            let options = self.options.clone();
-            let handle_resp = |res| {
-                self.handle_response(res)
-            };
-
-            let mut api_headers = self.get_headers();
-
-            async move {
-                let res = match method {
-                    ReqMethod::POST => client.post(&url)
-                        .json(&options)
-                        .headers(api_headers)
-                        .send()
-                        .await.map_err(|e| e.to_string())?,
-                    ReqMethod::PUT => client.put(&url)
-                        .json(&options)
-                        .headers(api_headers)
-                        .send()
-                        .await.map_err(|e| e.to_string())?,
-                    ReqMethod::PATCH => client.patch(&url)
-                        .json(&options)
-                        .headers(api_headers)
-                        .send()
-                        .await.map_err(|e| e.to_string())?,
-                    ReqMethod::DELETE => client.delete(&url)
-                        .json(&options)
-                        .headers(api_headers)
-                        .send()
-                        .await.map_err(|e| e.to_string())?,
-                    _ => client.get(&url)
-                        .headers(api_headers)
-                        .send()
-                        .await.map_err(|e| e.to_string())?,
+            Retry::spawn(retry_strategy, || {
+                
+                let client = &client;
+                let url = self.url.clone();
+                let method = self.method.clone();
+                let options = self.options.clone();
+                let handle_resp = |res| {
+                    self.handle_response(res)
                 };
 
-                let response = handle_resp(res).await?;
+                let mut api_headers = self.get_headers();
 
-                println!("Response: {:?}", response);
-                Ok(response)
-            }
-        }).await
+                async move {
+                    let res = match method {
+                        ReqMethod::POST => client.post(&url)
+                            .json(&options)
+                            .headers(api_headers)
+                            .send()
+                            .await.map_err(|e| e.to_string())?,
+                        ReqMethod::PUT => client.put(&url)
+                            .json(&options)
+                            .headers(api_headers)
+                            .send()
+                            .await.map_err(|e| e.to_string())?,
+                        ReqMethod::PATCH => client.patch(&url)
+                            .json(&options)
+                            .headers(api_headers)
+                            .send()
+                            .await.map_err(|e| e.to_string())?,
+                        ReqMethod::DELETE => client.delete(&url)
+                            .json(&options)
+                            .headers(api_headers)
+                            .send()
+                            .await.map_err(|e| e.to_string())?,
+                        _ => client.get(&url)
+                            .headers(api_headers)
+                            .send()
+                            .await.map_err(|e| e.to_string())?,
+                    };
+
+                    let response = handle_resp(res).await?;
+
+                    println!("Response: {:?}", response);
+                    Ok(response)
+                }
+            }).await
+        }
     }
 }
 
