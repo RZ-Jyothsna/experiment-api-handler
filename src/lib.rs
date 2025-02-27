@@ -1,16 +1,14 @@
-#![allow(unused)]
-use reqwest::{header::{self, HeaderMap, HeaderName, HeaderValue}, Error, Response, StatusCode};
-use serde::Deserialize;
+use reqwest::{header::{HeaderMap, HeaderName, HeaderValue}, Response, StatusCode};
 use std::collections::HashMap;
 use tokio_retry::strategy::{ExponentialBackoff, jitter};
 use tokio_retry::Retry;
 use pyo3::prelude::*;
-use pyo3::{types::PyString, FromPyObject};
+use pyo3::FromPyObject;
 use tokio::runtime::Runtime;
 use crate::workers::*;
 
 mod workers;
-mod dynamoDB;
+mod dynamo_db;
 
 pub type ReqMethod = reqwest::Method;
 
@@ -22,8 +20,6 @@ pub struct ApiRespInit {
     json: Option<HashMap<String, String>>,
     text: Option<String>,
     error_msg: Option<String>,
-    progress: Option<i32>,
-    retry_index: Option<i32>,
 }
 
 #[pyclass]
@@ -41,11 +37,6 @@ pub struct ApiResp {
     text: Option<String>,
     #[pyo3(get, set)]
     error_msg: Option<String>,
-    #[pyo3(get, set)]
-    progress: i32,
-    //Can remove this.
-    #[pyo3(get, set)]
-    retry_index: i32,
 }
 
 impl ApiResp {
@@ -57,8 +48,8 @@ impl ApiResp {
             json: resp.json,
             text: resp.text,
             error_msg: resp.error_msg,
-            progress: resp.progress.unwrap_or(100),
-            retry_index: resp.retry_index.unwrap_or(0),
+            // progress: resp.progress.unwrap_or(100),
+            // retry_index: resp.retry_index.unwrap_or(0),
         }
     }
 }
@@ -81,8 +72,6 @@ struct ApiReq {
     #[pyo3(get, set)]
     pub max_retries: Option<i8>,
     #[pyo3(get, set)]
-    pub retry_index: Option<i8>,
-    #[pyo3(get, set)]
     pub auto_retry: Option<bool>,
     #[pyo3(get, set)]
     pub retry_sleep: Option<i32>,
@@ -101,7 +90,6 @@ impl ApiReq {
         key: Option<String>,
         worker_group: Option<String>,
         max_retries: Option<i8>,
-        retry_index: Option<i8>,
         auto_retry: Option<bool>,
         retry_sleep: Option<i32>,
         use_worker: Option<bool>,
@@ -114,7 +102,6 @@ impl ApiReq {
             key,
             worker_group,
             max_retries,
-            retry_index,
             auto_retry,
             retry_sleep,
             use_worker,
@@ -131,12 +118,8 @@ pub struct ApiReqInit {
     key: Option<String>,
     worker_group: String,
     max_retries: i8,
-    // not needed for tokio-retry
-    retry_index: i8,
     auto_retry: bool,
     retry_sleep: i32,
-    // Check if this is needed.
-    resp: Option<ApiResp>,
     use_worker: bool,
 }
 
@@ -160,40 +143,39 @@ impl ApiReqInit {
             max_retries: req.max_retries.unwrap_or(10),
             auto_retry: req.auto_retry.unwrap_or(true),
             retry_sleep: req.retry_sleep.unwrap_or(10),
-            resp: None,
             use_worker: req.use_worker.unwrap_or(false),
-            retry_index: req.retry_index.unwrap_or(0),
         }
     }
     
     async fn before_request(&mut self) {
-        self.resp = Some(ApiResp { 
-            key: if let Some(val) = &self.key { 
-                val.to_string() 
-            } else {
-                self.key = Some("".to_string());
-                "".to_string()
-            },
-            ..Default::default()
-        });
+        // self.resp = Some(ApiResp { 
+        //     key: if let Some(val) = &self.key { 
+        //         val.to_string() 
+        //     } else {
+        //         self.key = Some("".to_string());
+        //         "".to_string()
+        //     },
+        //     ..Default::default()
+        // });
         // self.save_status().await;
     }
 
-    async fn update_progress(&mut self, key: String, progress: i32) {
-        match self.resp {
-            Some(ref mut resp) => {
-                resp.progress = progress;
-            }
-            None => {
-                self.resp = Some(ApiResp::new(ApiRespInit {
-                    key,
-                    progress: Some(progress),
-                    ..Default::default()
-                }));
-            }
-        }
-        // self.save_status().await;
-    }
+    // If progress needed, add this function in APiResponse impl.
+    // async fn update_progress(&mut self, key: String, progress: i32) {
+    //     match self.resp {
+    //         Some(ref mut resp) => {
+    //             resp.progress = progress;
+    //         }
+    //         None => {
+    //             self.resp = Some(ApiResp::new(ApiRespInit {
+    //                 key,
+    //                 progress: Some(progress),
+    //                 ..Default::default()
+    //             }));
+    //         }
+    //     }
+    //     // self.save_status().await;
+    // }
 
     // async fn save_status() {
     //  
@@ -205,7 +187,6 @@ impl ApiReqInit {
 
     async fn handle_response(&self, resp: Response) -> Result<ApiResp, String> {
         println!("resp: {:?}", resp);
-        // Adding new ApiResp, instead of overwriting the resp in ApiReq. (Not sure if this is the best way)
         let mut api_resp = ApiResp::new(ApiRespInit {
             key: if let Some(val) = &self.key { val.clone() } else { "".to_string() },
             ..Default::default()
@@ -258,7 +239,7 @@ impl ApiReqInit {
 
     fn get_headers(&self) -> HeaderMap {
         let mut api_headers = HeaderMap::new();
-        if let Some(headers) = &self.headers.clone() {
+        if let Some(headers) = &self.headers {
             for (k, v) in headers {
                 let key = HeaderName::try_from(k);
                 if let Ok(key) = key {
@@ -270,14 +251,14 @@ impl ApiReqInit {
     }
 
     async fn make_api_call(mut self) -> Result<ApiResp, String> {
+        // TODO: Finish it.
          if self.use_worker {
             &mut self.before_request().await;
             // Post request to worker and return request_id in resp.
             let message_id = sqs::send_message("", None, self.url).await.map_err(|e| e.to_string())?;
 
             let resp = ApiResp::new(ApiRespInit {
-                key: message_id.clone(),
-                text: Some(message_id),
+                key: message_id,
                 ..Default::default()
             });
 
@@ -294,38 +275,38 @@ impl ApiReqInit {
             Retry::spawn(retry_strategy, || {
                 
                 let client = &client;
-                let url = self.url.clone();
-                let method = self.method.clone();
-                let options = self.options.clone();
+                let url = &self.url;
+                let method = &self.method;
+                let options = &self.options;
                 let handle_resp = |res| {
                     self.handle_response(res)
                 };
 
-                let mut api_headers = self.get_headers();
+                let api_headers = self.get_headers();
 
                 async move {
-                    let res = match method {
-                        ReqMethod::POST => client.post(&url)
-                            .json(&options)
+                    let res = match *method {
+                        ReqMethod::POST => client.post(url)
+                            .json(options)
                             .headers(api_headers)
                             .send()
                             .await.map_err(|e| e.to_string())?,
-                        ReqMethod::PUT => client.put(&url)
-                            .json(&options)
+                        ReqMethod::PUT => client.put(url)
+                            .json(options)
                             .headers(api_headers)
                             .send()
                             .await.map_err(|e| e.to_string())?,
-                        ReqMethod::PATCH => client.patch(&url)
-                            .json(&options)
+                        ReqMethod::PATCH => client.patch(url)
+                            .json(options)
                             .headers(api_headers)
                             .send()
                             .await.map_err(|e| e.to_string())?,
-                        ReqMethod::DELETE => client.delete(&url)
-                            .json(&options)
+                        ReqMethod::DELETE => client.delete(url)
+                            .json(options)
                             .headers(api_headers)
                             .send()
                             .await.map_err(|e| e.to_string())?,
-                        _ => client.get(&url)
+                        _ => client.get(url)
                             .headers(api_headers)
                             .send()
                             .await.map_err(|e| e.to_string())?,
@@ -342,8 +323,8 @@ impl ApiReqInit {
 }
 
 #[pyfunction]
-fn get(py: Python, req: ApiReq) -> PyResult<ApiResp> {
-    let mut api_req = ApiReqInit::new(req);
+fn get(_py: Python, req: ApiReq) -> PyResult<ApiResp> {
+    let api_req = ApiReqInit::new(req);
 
     let rt = Runtime::new().unwrap();
 
@@ -355,8 +336,8 @@ fn get(py: Python, req: ApiReq) -> PyResult<ApiResp> {
 }
 
 #[pyfunction]
-fn post(py: Python, req: ApiReq) -> PyResult<ApiResp> {
-    let mut api_req = ApiReqInit::new(req);
+fn post(_py: Python, req: ApiReq) -> PyResult<ApiResp> {
+    let api_req = ApiReqInit::new(req);
 
     let rt = Runtime::new().unwrap();
 
@@ -373,7 +354,7 @@ pub fn example_fn() {
 }
 
 #[pymodule]
-fn api_handler(py: Python, m: &PyModule) -> PyResult<()> {
+fn api_handler(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<ApiReq>()?;
     m.add_class::<ApiResp>()?;
     m.add_function(wrap_pyfunction!(get, m)?)?;
